@@ -6,6 +6,7 @@ import akka.stream.scaladsl._
 import akka.stream.stage._
 
 import scala.concurrent._
+import scala.collection.mutable.{Buffer, LinkedHashMap}
 
 object Components {
   /**
@@ -43,18 +44,15 @@ object Components {
   case class BundlingBuffer[U](size: Int, overflowStrategy: OverflowStrategy) extends GraphStage[FlowShape[(Promise[Unit], U), (Promise[Unit], U)]] {
     type T = (Promise[Unit], U)
 
-    // import OverflowStrategy._
+    private val promises: LinkedHashMap[U, Promise[Unit]] = LinkedHashMap.empty
+    private val buffer: Buffer[U] = Buffer.empty
+    private def bufferIsFull: Boolean = buffer.length >= size
 
-    private val promises = scala.collection.mutable.LinkedHashMap.empty[U, Promise[Unit]]
-    private val buffer = scala.collection.mutable.Buffer.empty[U]
-
-    // private val buffer = FixedSizeBuffer[T](size)
-
-    private def dequeue(): (Promise[Unit], U) = {
+    private def dequeue(): T = synchronized {
       val v = buffer.remove(0)
       (promises.remove(v).get, v)
     }
-    private def enqueue(v: T): Unit = {
+    private def enqueue(v: T): Unit = synchronized {
       promises.get(v._2) match {
         case Some(p) =>
           v._1.completeWith(p.future)
@@ -64,90 +62,72 @@ object Components {
       }
     }
 
-    override def onPush(elem: T, ctx: DetachedContext[T]): UpstreamDirective =
-      if (ctx.isHoldingDownstream) ctx.pushAndPull(elem)
-      else enqueueAction(ctx, elem)
-
-    override def onPull(ctx: DetachedContext[T]): DownstreamDirective = {
-      if (ctx.isFinishing) {
-        val elem = dequeue()
-        if (buffer.isEmpty) ctx.pushAndFinish(elem)
-        else ctx.push(elem)
-      } else if (ctx.isHoldingUpstream) ctx.pushAndPull(dequeue())
-      else if (buffer.isEmpty) ctx.holdDownstream()
-      else ctx.push(dequeue())
-    }
-
-    override def onUpstreamFinish(ctx: DetachedContext[T]): TerminationDirective =
-      if (buffer.isEmpty) ctx.finish()
-      else ctx.absorbTermination()
-
-    /* we have to pull these out again and make the capitals for
-     * pattern matching. Akka is the ultimate hider of useful
-     * types. */
-    val DropHead = OverflowStrategy.dropHead
-    val DropTail = OverflowStrategy.dropTail
-    val DropBuffer = OverflowStrategy.dropBuffer
-    val DropNew = OverflowStrategy.dropNew
-    val Backpressure = OverflowStrategy.backpressure
-    val Fail = OverflowStrategy.fail
-
-    def bufferIsFull =
-      buffer.length >= size
-
-    def dropped(values: U *): Unit = {
+    private def dropped(values: U*): Unit =
       values.foreach { i =>
-        promises.remove(i).get.tryFailure(
-          DroppedException(
-            s"message was dropped due to buffer overflow; size = $size"))
+        promises.remove(i).map(_.tryFailure(
+          DroppedException(s"message was dropped due to buffer overflow; size = $size")
+        ))
       }
-    }
 
-    val enqueueAction: (DetachedContext[T], T) ⇒ UpstreamDirective = {
-      overflowStrategy match {
-        case DropHead ⇒ (ctx, elem) ⇒
-          if (bufferIsFull) dropped(buffer.remove(0))
-          enqueue(elem)
-          ctx.pull()
-        case DropTail ⇒ (ctx, elem) ⇒
-          if (bufferIsFull) dropped(buffer.remove(buffer.length - 1))
-          enqueue(elem)
-          ctx.pull()
-        case DropBuffer ⇒ (ctx, elem) ⇒
-          if (bufferIsFull) {
-            dropped(buffer : _*)
-            buffer.clear()
+     /* we have to pull these out again and make the capitals for
+      * pattern matching. Akka is the ultimate hider of useful
+      * types. */
+     val DropHead = OverflowStrategy.dropHead
+     val DropTail = OverflowStrategy.dropTail
+     val DropBuffer = OverflowStrategy.dropBuffer
+     val DropNew = OverflowStrategy.dropNew
+     val Backpressure = OverflowStrategy.backpressure
+     val Fail = OverflowStrategy.fail
+
+
+    val in  = Inlet[T]("BundlingBuffer.in")
+    val out = Outlet[T]("BundlingBuffer.out")
+
+    override def shape: FlowShape[T, T] = FlowShape.of(in, out)
+    override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
+      new GraphStageLogic(shape) {
+        override def preStart(): Unit = pull(in)
+
+        setHandler(in, new InHandler {
+          override def onPush(): Unit = {
+            if (isAvailable(in) && isAvailable(out)) {
+              enqueue(grab(in))
+              pull(in)
+              push(out, dequeue())
+            }
+            else if (isAvailable(in)) {
+              if (bufferIsFull)
+                overflowStrategy match {
+	                case DropHead => dropped(buffer.remove(0))
+                  case DropTail => dropped(buffer.remove(buffer.length - 1))
+                  case DropBuffer =>
+                    dropped(buffer : _*)
+                    buffer.clear()
+                  case Fail =>
+                    failStage(new BufferOverflowException(
+                                s"Buffer overflow (max capacity was: $size)!"
+                              ))
+                  case _ => () // Other cases don't modify the buffer
+                }
+              if (!bufferIsFull || overflowStrategy != Backpressure) {
+                enqueue(grab(in))
+                pull(in)
+              }
+            }
           }
-          enqueue(elem)
-          ctx.pull()
-        case DropNew ⇒ (ctx, elem) ⇒
-          if (!bufferIsFull)
-            enqueue(elem)
-          else
-            elem._1.tryFailure(
-              DroppedException(
-                s"message was dropped due to buffer overflow; size = $size"))
-          ctx.pull()
-        case Backpressure ⇒ (ctx, elem) ⇒
-          enqueue(elem)
-          if (bufferIsFull) ctx.holdUpstream()
-          else ctx.pull()
-        case Fail ⇒ (ctx, elem) ⇒
-          if (bufferIsFull) {
-            elem._1.tryFailure(
-              DroppedException(
-                s"message was dropped due to buffer overflow; size = $size"))
-            ctx.fail(
-              new BufferOverflowException(s"Buffer overflow (max capacity was: $size)!"))
+        })
+
+        setHandler(out, new OutHandler {
+          override def onPull(): Unit = {
+            if (buffer.nonEmpty) {
+              push(out, dequeue())
+              if (isAvailable(in)) {
+                enqueue(grab(in))
+                pull(in)
+              }
+            }
           }
-          else {
-            enqueue(elem)
-            ctx.pull()
-          }
-        case _ ⇒
-          throw(new RuntimeException(s"BundlingBuffer unsupported overflow strategy: ${overflowStrategy}."))
+         })
       }
-    }
   }
-
 }
